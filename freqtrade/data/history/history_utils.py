@@ -1,5 +1,6 @@
 import logging
 import operator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -404,6 +405,104 @@ def refresh_backtest_ohlcv_data(
     return pairs_not_available
 
 
+def _p_tf_dl(
+    pair,
+    datadir,
+    exchange,
+    timerange,
+    data_format,
+    timeframe,
+    new_pairs_days,
+    candle_type,
+    erase,
+    prepend
+):
+    status = None
+    if pair in exchange.markets:
+        data_handler = get_datahandler(datadir, data_format)
+        status = _download_pair_history(
+            pair=pair,
+            datadir=datadir,
+            exchange=exchange,
+            timerange=timerange,
+            data_handler=data_handler,
+            timeframe=timeframe,
+            new_pairs_days=new_pairs_days,
+            candle_type=candle_type,
+            erase=erase,
+            prepend=prepend,
+        )
+
+    return pair, candle_type, timeframe, status
+
+def parallel_refresh_backtest_ohlcv_data(
+    exchange: Exchange,
+    pairs: List[str],
+    timeframes: List[str],
+    datadir: Path,
+    trading_mode: str,
+    timerange: Optional[TimeRange] = None,
+    new_pairs_days: int = 30,
+    erase: bool = False,
+    data_format: Optional[str] = None,
+    prepend: bool = False,
+) -> List[str]:
+    """
+    Parallel version of refresh_backtest_ohlcv_data()
+    """
+
+    pairs_not_available = []
+    with get_progress_tracker() as progress:
+        total = len(timeframes) * len(pairs)
+        cdlt_tf = [(CandleType.get_default(trading_mode), tf) for tf in timeframes]
+        if trading_mode == "futures":
+            # Predefined candletype (and timeframe) depending on exchange
+            # Downloads what is necessary to backtest based on futures data.
+            tf_mark = exchange.get_option("mark_ohlcv_timeframe")
+            tf_funding_rate = exchange.get_option("funding_fee_timeframe")
+
+            fr_candle_type = CandleType.from_string(exchange.get_option("mark_ohlcv_price"))
+            # All exchanges need FundingRate for futures trading.
+            # The timeframe is aligned to the mark-price timeframe.
+            cdlt_tf = [(CandleType.FUNDING_RATE, tf_funding_rate), (fr_candle_type, tf_mark)]
+            total = (len(timeframes) + 2) * len(pairs)
+
+        futures = []
+        global_task = progress.add_task(description=f"Downloading data ", total=total)
+        with ThreadPoolExecutor() as executor:
+            for pair in pairs:
+                for cdlt, tf in cdlt_tf:
+                    logger.debug(f"Downloading pair {pair}, {cdlt}, interval {tf} ...")
+                    future = executor.submit(
+                        _p_tf_dl,
+                        pair,
+                        datadir,
+                        exchange,
+                        timerange,
+                        data_format,
+                        tf,
+                        new_pairs_days,
+                        cdlt,
+                        erase,
+                        prepend,
+                    )
+                    futures.append(future)
+
+            while (num_completed := len((completed := [f for f in futures if f.done()]))) < len(
+                futures
+            ):
+                progress.update(task_id=global_task, completed=num_completed)
+                for future in completed:
+                    (pair, cdlt, tf, status) = future.result()
+                    if status is None:
+                        logger.info(f"Skipping pair {pair}...")
+                        pairs_not_available.append(pair)
+                    if status is False:
+                        logger.warning(f"Download failed for {pair}, {cdlt}, {tf}.")
+
+    return pairs_not_available
+
+
 def _download_trades_history(
     exchange: Exchange,
     pair: str,
@@ -666,7 +765,7 @@ def download_data_main(config: Config) -> None:
                     "(will unfortunately take a long time)."
                 )
             migrate_data(config, exchange)
-            pairs_not_available = refresh_backtest_ohlcv_data(
+            pairs_not_available = parallel_refresh_backtest_ohlcv_data(
                 exchange,
                 pairs=expanded_pairs,
                 timeframes=config["timeframes"],
